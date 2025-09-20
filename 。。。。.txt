@@ -1,0 +1,2089 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+
+-- ===== ESP 配置区域 =====
+local SETTINGS = {
+    ENEMY_TAGS = {"Rake", "Monster", "Enemy"},
+    ENEMY_COLOR = Color3.fromRGB(255, 50, 50),
+    
+    PLAYER_COLOR = Color3.fromRGB(50, 150, 255),
+    TEAM_COLOR = Color3.fromRGB(50, 255, 100),
+    
+    SHOW_HEALTH = true,
+    SHOW_DISTANCE = true,
+    SHOW_TRACER = true,
+    TRACER_COLOR = Color3.fromRGB(0, 150, 255),
+    ENEMY_TRACER_COLOR = Color3.fromRGB(255, 50, 50),
+    TRACER_THICKNESS = 0.1,
+    
+    MAX_DISTANCE = 1000,
+    HEALTH_TEXT_SIZE = 16,
+    DISTANCE_TEXT_SIZE = 14,
+    NAME_TEXT_SIZE = 18,
+    UPDATE_RATE = 0.005,
+    
+    SCAN_INTERVAL = 5,
+    TRACER_FOR_ENEMIES = true,
+    
+    HIGHLIGHT_DISABLE_DISTANCE = 4  
+}
+
+-- 独立的ESP开关状态 - 全部默认关闭
+local playerEspEnabled = false
+local enemyEspEnabled = false
+local trashEspEnabled = false
+local nightVisionEnabled = false
+local flareGunEspEnabled = false  -- 信号枪透视开关
+local airdropEspEnabled = false   -- 空投透视开关
+
+-- 速度控制变量 - 默认关闭
+local TARGET_SPEED = 26
+local isSpeedBoostEnabled = false
+local currentHumanoid = nil
+local speedMaintainConnection = nil
+
+-- 地点标记变量 - 默认关闭
+local isLocationMarkersEnabled = false
+local markerPositions = {
+    watchtower = Vector3.new(48.06, 57.82, -46.03),   -- 瞭望塔坐标
+    redhouse = Vector3.new(-36.38, 17.61, 200.02),    -- 红房坐标
+    safehouse = Vector3.new(-359.93, 15.37, 69.19),   -- 安全屋坐标
+    powerstation = Vector3.new(-308.60, 20.00, -208.13), -- 发电站坐标
+    store = Vector3.new(-25.96, 16.31, -252.33),      -- 商店坐标
+    rakenest = Vector3.new(-154.01, 19.84, 29.52)     -- Rake老巢坐标
+}
+
+local markerConfigs = {
+    watchtower = {
+        text = "瞭望塔\n  ·",
+        color = Color3.fromRGB(170, 0, 255)  -- 紫色
+    },
+    redhouse = {
+        text = "红房\n ·",
+        color = Color3.fromRGB(255, 50, 50)  -- 亮红色
+    },
+    safehouse = {
+        text = "安全屋\n  ·",
+        color = Color3.fromRGB(50, 255, 50)  -- 绿色
+    },
+    powerstation = {
+        text = "发电站\n  ·",
+        color = Color3.fromRGB(139, 69, 19)  -- 棕色
+    },
+    store = {
+        text = "商店\n ·",
+        color = Color3.fromRGB(0, 100, 255)  -- 蓝色
+    },
+    rakenest = {
+        text = "Rake老巢\n   ·",
+        color = Color3.fromRGB(255, 255, 0)  -- 黄色
+    }
+}
+
+local markers = {}
+
+local espCache = {}
+local lastScanTime = 0
+local nightVisionConnection
+
+-- ===== 信号枪透视配置 =====
+local flareGunConfig = {
+    maxDistance = 2000, -- 最大检测距离(stud)
+    highlightColor = Color3.fromRGB(255, 50, 50), -- 高亮颜色(红色系)
+    highlightTransparency = 0.3, -- 透明度
+    scanInterval = 1, -- 全图扫描间隔(秒)
+    updateInterval = 0.1, -- 更新间隔(秒)
+    labelColor = Color3.fromRGB(255, 150, 150), -- 标签颜色(淡红色)
+    labelSize = 15, -- 标签字体大小
+    maxLabels = 50, -- 最大显示标签数量
+    tagPrefix = "[信号枪]", -- 标签前缀
+    scanKey = Enum.KeyCode.T, -- 全图扫描快捷键
+    notificationDuration = 3, -- 提示显示时间(秒)
+    notificationColor = Color3.fromRGB(139, 0, 0), -- 深红色提示
+    notificationCooldown = 30 -- 提示冷却时间(秒)
+}
+
+-- ===== 空投透视配置 =====
+local airdropConfig = {
+    maxDistance = 2000, -- 最大检测距离(stud)
+    scanInterval = 1, -- 全图扫描间隔(秒)
+    updateInterval = 0.1, -- 更新间隔(秒)
+    labelSize = 15, -- 标签字体大小
+    maxLabels = 50, -- 最大显示标签数量
+    scanKey = Enum.KeyCode.Y, -- 全图扫描快捷键(使用不同的按键)
+    
+    -- 不显示任何标签的区域设置
+    noDisplayZone = {
+        center = Vector3.new(-365.87, 16.39, 73.87), -- 区域中心坐标
+        radius = 10 -- 区域半径(stud)
+    },
+    
+    -- 密集区域设置
+    denseArea = {
+        radius = 15, -- 密集区域半径(stud)
+        threshold = 6, -- 触发密集处理的废料数量阈值
+        airdropPrefix = "[空投]", -- 密集区域显示的前缀
+        airdropColor = Color3.fromRGB(139, 0, 0) -- 深红色
+    }
+}
+
+-- ===== 信号枪透视变量 =====
+local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local camera = workspace.CurrentCamera
+
+local flareGunHighlightedItems = {}
+local flareGunItemCache = {}
+local flareGunLastScanTime = 0
+local flareGunScanning = false
+local flareGunLastNotificationTime = 0
+local flareGunNotificationGui = nil
+local flareGunNotificationCooldown = 0 -- 提示冷却计时器
+
+-- ===== 空投透视变量 =====
+local airdropLabeledTrash = {}
+local airdropTrashCache = {}
+local airdropLastScanTime = 0
+local airdropScanning = false
+
+-- ===== 高级废料透视脚本 =====
+local trashConfig = {
+    maxDistance = 2000, -- 最大检测距离(stud)
+    highlightColor = Color3.fromRGB(0, 255, 0), -- 高亮颜色
+    highlightTransparency = 0.3, -- 透明度
+    scanInterval = 1, -- 全图扫描间隔(秒)
+    updateInterval = 0.1, -- 更新间隔(秒)
+    labelColor = Color3.fromRGB(210, 180, 140), -- 标签颜色（浅棕色）
+    labelSize = 15, -- 标签字体大小
+    maxLabels = 50, -- 最大显示标签数量
+    tagPrefix = "[废料]", -- 标签前缀
+    scanKey = Enum.KeyCode.T, -- 全图扫描快捷键
+    denseThreshold = 6, -- 密集废料阈值
+    denseRadius = 15 -- 密集区域半径(stud)
+}
+
+-- 存储已高亮的废料
+local highlightedTrash = {}
+local trashCache = {}
+local lastScanTimeTrash = 0
+local trashScanning = false
+
+-- ===== 地点标记功能 =====
+local function createMarker(position, text, color)
+    -- 创建广告牌GUI的容器
+    local part = Instance.new("Part")
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 1  -- 完全透明，我们只需要它的位置
+    part.Size = Vector3.new(2, 2, 2)
+    part.Position = position
+    part.Parent = workspace
+    
+    -- 创建广告牌GUI
+    local billboard = Instance.new("BillboardGui")
+    billboard.Adornee = part
+    billboard.Size = UDim2.new(0, 200, 0, 80)
+    billboard.StudsOffset = Vector3.new(0, 3, 0)  -- 在部件上方显示
+    billboard.AlwaysOnTop = true
+    billboard.Enabled = isLocationMarkersEnabled  -- 根据当前状态设置可见性
+    
+    -- 创建文本标签
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.Font = Enum.Font.SourceSansBold
+    label.TextColor3 = color
+    label.TextSize = 24
+    label.TextStrokeTransparency = 0.8  -- 文字描边，使其在各种背景下都清晰可见
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.Parent = billboard
+    
+    billboard.Parent = part
+    
+    return part
+end
+
+-- 创建所有标记
+local function createAllMarkers()
+    for markerType, position in pairs(markerPositions) do
+        markers[markerType] = createMarker(
+            position, 
+            markerConfigs[markerType].text, 
+            markerConfigs[markerType].color
+        )
+    end
+end
+
+-- 切换地点标记状态
+local function toggleLocationMarkers()
+    isLocationMarkersEnabled = not isLocationMarkersEnabled
+    
+    -- 更新所有标记的可见性
+    for _, marker in pairs(markers) do
+        if marker and marker:FindFirstChild("BillboardGui") then
+            marker.BillboardGui.Enabled = isLocationMarkersEnabled
+        end
+    end
+    
+    return isLocationMarkersEnabled
+end
+
+-- 初始化地点标记
+createAllMarkers()
+
+-- ===== 速度控制功能 =====
+local function maintainSpeed()
+    if currentHumanoid and currentHumanoid:IsDescendantOf(workspace) then
+        currentHumanoid.WalkSpeed = TARGET_SPEED
+    end
+end
+
+local function setupSpeedMaintenance()
+    if speedMaintainConnection then
+        speedMaintainConnection:Disconnect()
+        speedMaintainConnection = nil
+    end
+    
+    if isSpeedBoostEnabled then
+        speedMaintainConnection = RunService.Heartbeat:Connect(function()
+            maintainSpeed()
+        end)
+    end
+end
+
+local function initializeCharacter(character)
+    local humanoid = character:WaitForChild("Humanoid")
+    currentHumanoid = humanoid
+    
+    if isSpeedBoostEnabled then
+        maintainSpeed()
+        setupSpeedMaintenance()
+    end
+    
+    humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+        if isSpeedBoostEnabled then
+            maintainSpeed()
+        end
+    end)
+end
+
+local function toggleSpeedBoost()
+    isSpeedBoostEnabled = not isSpeedBoostEnabled
+    
+    if isSpeedBoostEnabled then
+        if currentHumanoid and currentHumanoid:IsDescendantOf(workspace) then
+            maintainSpeed()
+            setupSpeedMaintenance()
+        end
+    else
+        if currentHumanoid and currentHumanoid:IsDescendantOf(workspace) then
+            currentHumanoid.WalkSpeed = 16
+        end
+        
+        if speedMaintainConnection then
+            speedMaintainConnection:Disconnect()
+            speedMaintainConnection = nil
+        end
+    end
+    
+    return isSpeedBoostEnabled
+end
+
+-- 初始化角色速度控制
+if LocalPlayer.Character then
+    initializeCharacter(LocalPlayer.Character)
+end
+
+LocalPlayer.CharacterAdded:Connect(initializeCharacter)
+LocalPlayer.CharacterRemoving:Connect(function()
+    if speedMaintainConnection then
+        speedMaintainConnection:Disconnect()
+        speedMaintainConnection = nil
+    end
+    currentHumanoid = nil
+end)
+
+-- ===== ESP 功能函数 =====
+local function shouldShowESP(target, data)
+    if not target.Parent then return false end
+    
+    local isEnemy = false
+    for _, tag in ipairs(SETTINGS.ENEMY_TAGS) do
+        if target.Name:find(tag) or target:FindFirstChild(tag) then
+            isEnemy = true
+            break
+        end
+    end
+    
+    local isTeammate = false
+    if not isEnemy and target:FindFirstChild("Team") then
+        if LocalPlayer.Team and target.Team == LocalPlayer.Team then
+            isTeammate = true
+        end
+    end
+    
+    if isEnemy then
+        return enemyEspEnabled
+    elseif isTeammate then
+        return playerEspEnabled
+    else
+        return playerEspEnabled
+    end
+end
+
+local function createESP(target)
+    if not target or not target:FindFirstChild("HumanoidRootPart") then return end
+    
+    if espCache[target] then return end
+    
+    local isEnemy = false
+    local isTeammate = false
+    local espColor = SETTINGS.PLAYER_COLOR
+    
+    for _, tag in ipairs(SETTINGS.ENEMY_TAGS) do
+        if target.Name:find(tag) or target:FindFirstChild(tag) then
+            isEnemy = true
+            espColor = SETTINGS.ENEMY_COLOR
+            break
+        end
+    end
+    
+    if not isEnemy and target:FindFirstChild("Team") then
+        if LocalPlayer.Team and target.Team == LocalPlayer.Team then
+            isTeammate = true
+            espColor = SETTINGS.TEAM_COLOR
+        end
+    end
+    
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "AdvancedESP_Highlight"
+    highlight.FillColor = espColor
+    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+    highlight.FillTransparency = 0.3
+    highlight.OutlineTransparency = 0
+    highlight.Parent = target
+    
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "AdvancedESP_Billboard"
+    billboard.Adornee = target.HumanoidRootPart
+    billboard.Size = UDim2.new(0, 150, 0, 60)
+    billboard.StudsOffset = Vector3.new(0, 3.5, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Enabled = shouldShowESP(target, {isEnemy = isEnemy, isTeammate = isTeammate})
+    billboard.Parent = target
+    
+    local distanceText = Instance.new("TextLabel")
+    distanceText.Name = "ESP_Distance"
+    distanceText.Size = UDim2.new(1, 0, 0.3, 0)
+    distanceText.Position = UDim2.new(0, 0, 0, 0)
+    distanceText.BackgroundTransparency = 1
+    distanceText.TextColor3 = Color3.fromRGB(200, 200, 255)
+    distanceText.TextStrokeTransparency = 0.5
+    distanceText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    distanceText.TextSize = SETTINGS.DISTANCE_TEXT_SIZE
+    distanceText.Font = Enum.Font.SourceSansBold
+    distanceText.TextXAlignment = Enum.TextXAlignment.Center
+    distanceText.Parent = billboard
+    
+    local healthText = Instance.new("TextLabel")
+    healthText.Name = "ESP_Health"
+    healthText.Size = UDim2.new(1, 0, 0.4, 0)
+    healthText.Position = UDim2.new(0, 0, 0.3, 0)
+    healthText.BackgroundTransparency = 1
+    healthText.TextColor3 = Color3.fromRGB(255, 255, 255)
+    healthText.TextStrokeTransparency = 0.5
+    healthText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    healthText.TextSize = SETTINGS.HEALTH_TEXT_SIZE
+    healthText.Font = Enum.Font.SourceSansBold
+    healthText.TextXAlignment = Enum.TextXAlignment.Center
+    healthText.Parent = billboard
+    
+    local nameText = Instance.new("TextLabel")
+    nameText.Name = "ESP_Name"
+    nameText.Size = UDim2.new(1, 0, 0.3, 0)
+    nameText.Position = UDim2.new(0, 0, 0.7, 0)
+    nameText.BackgroundTransparency = 1
+    nameText.TextColor3 = espColor
+    nameText.TextStrokeTransparency = 0.5
+    nameText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    nameText.TextSize = SETTINGS.NAME_TEXT_SIZE
+    nameText.Font = Enum.Font.SourceSansBold
+    nameText.TextXAlignment = Enum.TextXAlignment.Center
+    nameText.Parent = billboard
+    
+    local tracer
+    if SETTINGS.SHOW_TRACER and (not isEnemy or SETTINGS.TRACER_FOR_ENEMIES) then
+        local startAttachment = Instance.new("Attachment")
+        startAttachment.Name = "TracerStart"
+        startAttachment.Parent = workspace.CurrentCamera
+        
+        local endAttachment = Instance.new("Attachment")
+        endAttachment.Name = "TracerEnd"
+        endAttachment.Parent = target.HumanoidRootPart
+        
+        tracer = Instance.new("Beam")
+        tracer.Name = "ESP_Tracer"
+        tracer.Attachment0 = startAttachment
+        tracer.Attachment1 = endAttachment
+        tracer.Color = ColorSequence.new(isEnemy and SETTINGS.ENEMY_TRACER_COLOR or SETTINGS.TRACER_COLOR)
+        tracer.Width0 = SETTINGS.TRACER_THICKNESS
+        tracer.Width1 = SETTINGS.TRACER_THICKNESS * 0.8
+        tracer.LightEmission = 0.8
+        tracer.Transparency = NumberSequence.new(0.5)
+        tracer.FaceCamera = true
+        tracer.Enabled = shouldShowESP(target, {isEnemy = isEnemy, isTeammate = isTeammate})
+        tracer.Parent = target.HumanoidRootPart
+    end
+    
+    espCache[target] = {
+        highlight = highlight,
+        billboard = billboard,
+        tracer = tracer,
+        humanoid = target:FindFirstChildOfClass("Humanoid"),
+        rootPart = target.HumanoidRootPart,
+        startAttachment = tracer and tracer.Attachment0,
+        endAttachment = tracer and tracer.Attachment1,
+        isEnemy = isEnemy,
+        isTeammate = isTeammate
+    }
+    
+    -- 根据当前ESP状态设置高亮
+    highlight.Enabled = shouldShowESP(target, {isEnemy = isEnemy, isTeammate = isTeammate})
+end
+
+local function fullScan()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            createESP(player.Character)
+        end
+    end
+    
+    for _, descendant in ipairs(workspace:GetDescendants()) do
+        if descendant:IsA("Model") and descendant:FindFirstChild("HumanoidRootPart") then
+            for _, tag in ipairs(SETTINGS.ENEMY_TAGS) do
+                if descendant.Name:find(tag) or descendant:FindFirstChild(tag) then
+                    createESP(descendant)
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- ===== ESP 更新循环 =====
+local lastUpdate = 0
+
+RunService.Heartbeat:Connect(function(deltaTime)
+    lastUpdate = lastUpdate + deltaTime
+    lastScanTime = lastScanTime + deltaTime
+    
+    if lastScanTime >= SETTINGS.SCAN_INTERVAL then
+        lastScanTime = 0
+        fullScan()
+    end
+    
+    if lastUpdate < SETTINGS.UPDATE_RATE then return end
+    lastUpdate = 0
+    
+    if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
+    local localRoot = LocalPlayer.Character.HumanoidRootPart
+    
+    for target, data in pairs(espCache) do
+        if not target.Parent then
+            if data.highlight then data.highlight:Destroy() end
+            if data.billboard then data.billboard:Destroy() end
+            if data.tracer then data.tracer:Destroy() end
+            espCache[target] = nil
+        else
+            local distance = (data.rootPart.Position - localRoot.Position).Magnitude
+            local distanceInMeters = distance / 3.571
+            local shouldShow = distance <= SETTINGS.MAX_DISTANCE and shouldShowESP(target, data)
+            
+            data.billboard.Enabled = shouldShow
+            if data.tracer then
+                data.tracer.Enabled = shouldShow
+                if data.startAttachment then
+                    data.startAttachment.WorldPosition = localRoot.Position - Vector3.new(0, 1.5, 0)
+                end
+            end
+            
+            if shouldShow then
+                if distanceInMeters < SETTINGS.HIGHLIGHT_DISABLE_DISTANCE then
+                    data.highlight.Enabled = false
+                else
+                    data.highlight.Enabled = true
+                end
+            else
+                data.highlight.Enabled = false
+            end
+            
+            if shouldShow then
+                if SETTINGS.SHOW_DISTANCE then
+                    data.billboard.ESP_Distance.Text = string.format("%.1fm", distanceInMeters)
+                else
+                    data.billboard.ESP_Distance.Text = ""
+                end
+                
+                if SETTINGS.SHOW_HEALTH and data.humanoid then
+                    data.billboard.ESP_Health.Text = string.format("HP: %d/%d", 
+                        math.floor(data.humanoid.Health), 
+                        math.floor(data.humanoid.MaxHealth))
+                else
+                    data.billboard.ESP_Health.Text = ""
+                end
+                
+                data.billboard.ESP_Name.Text = target.Name
+            end
+        end
+    end
+end)
+
+-- ===== ESP 初始化和事件监听 =====
+fullScan()
+
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function(character)
+        createESP(character)
+    end)
+end)
+
+workspace.DescendantAdded:Connect(function(descendant)
+    if descendant:IsA("Model") and descendant:FindFirstChild("HumanoidRootPart") then
+        for _, tag in ipairs(SETTINGS.ENEMY_TAGS) do
+            if descendant.Name:find(tag) or descendant:FindFirstChild(tag) then
+                createESP(descendant)
+                break
+            end
+        end
+    end
+end)
+
+LocalPlayer.CharacterRemoving:Connect(function()
+    for _, data in pairs(espCache) do
+        if data.highlight then data.highlight:Destroy() end
+        if data.billboard then data.billboard:Destroy() end
+        if data.tracer then data.tracer:Destroy() end
+    end
+    espCache = {}
+end)
+
+-- ===== 夜视功能 =====
+local originalBrightness = Lighting.Brightness
+local originalExposureCompensation = Lighting.ExposureCompensation
+local originalClockTime = Lighting.ClockTime
+local originalFogEnd = Lighting.FogEnd
+
+local function enableNightVision()
+    Lighting.Brightness = 1.8
+    Lighting.ExposureCompensation = 1.4
+    
+    Lighting.ClockTime = 12
+    
+    if Lighting.FogEnd < 5000 then
+        Lighting.FogEnd = 5000
+    end
+    
+    if not Lighting:FindFirstChild("NightVisionBloom") then
+        local bloom = Instance.new("BloomEffect")
+        bloom.Name = "NightVisionBloom"
+        bloom.Intensity = 0.1
+        bloom.Threshold = 0.85
+        bloom.Size = 16
+        bloom.Parent = Lighting
+    end
+    
+    if not Lighting:FindFirstChild("NightVisionColorCorrection") then
+        local colorCorrection = Instance.new("ColorCorrectionEffect")
+        colorCorrection.Name = "NightVisionColorCorrection"
+        colorCorrection.Brightness = 0.12
+        colorCorrection.Contrast = 0.2
+        colorCorrection.Saturation = 0
+        colorCorrection.TintColor = Color3.fromRGB(255, 255, 255)
+        colorCorrection.Parent = Lighting
+    end
+    
+    if nightVisionConnection then
+        nightVisionConnection:Disconnect()
+    end
+    
+    nightVisionConnection = RunService.RenderStepped:Connect(function()
+        if Lighting.Brightness < 1.6 then
+            Lighting.Brightness = 1.8
+        end
+        
+        if Lighting.ExposureCompensation < 1.3 then
+            Lighting.ExposureCompensation = 1.4
+        end
+        
+        if Lighting.ClockTime < 8 or Lighting.ClockTime > 16 then
+            Lighting.ClockTime = 12
+        end
+        
+        if Lighting.FogEnd < 5000 then
+            Lighting.FogEnd = 5000
+        end
+        
+        if not Lighting:FindFirstChild("NightVisionBloom") then
+            local bloom = Instance.new("BloomEffect")
+            bloom.Name = "NightVisionBloom"
+            bloom.Intensity = 0.1
+            bloom.Threshold = 0.85
+            bloom.Size = 16
+            bloom.Parent = Lighting
+        end
+        
+        if not Lighting:FindFirstChild("NightVisionColorCorrection") then
+            local colorCorrection = Instance.new("ColorCorrectionEffect")
+            colorCorrection.Name = "NightVisionColorCorrection"
+            colorCorrection.Brightness = 0.12
+            colorCorrection.Contrast = 0.2
+            colorCorrection.Saturation = 0
+            colorCorrection.TintColor = Color3.fromRGB(255, 255, 255)
+            colorCorrection.Parent = Lighting
+        end
+    end)
+end
+
+local function disableNightVision()
+    if nightVisionConnection then
+        nightVisionConnection:Disconnect()
+        nightVisionConnection = nil
+    end
+    
+    Lighting.Brightness = originalBrightness
+    Lighting.ExposureCompensation = originalExposureCompensation
+    Lighting.ClockTime = originalClockTime
+    Lighting.FogEnd = originalFogEnd
+    
+    local bloom = Lighting:FindFirstChild("NightVisionBloom")
+    if bloom then
+        bloom:Destroy()
+    end
+    
+    local colorCorrection = Lighting:FindFirstChild("NightVisionColorCorrection")
+    if colorCorrection then
+        colorCorrection:Destroy()
+    end
+end
+
+local function toggleNightVision()
+    nightVisionEnabled = not nightVisionEnabled
+    
+    if nightVisionEnabled then
+        enableNightVision()
+        print("夜视功能已启用")
+    else
+        disableNightVision()
+        print("夜视功能已禁用")
+    end
+    
+    return nightVisionEnabled
+end
+
+game:GetService("Players").LocalPlayer:GetPropertyChangedSignal("Parent"):Connect(function()
+    if not game:GetService("Players").LocalPlayer.Parent then
+        disableNightVision()
+    end
+end)
+
+-- ===== 高级废料透视功能 =====
+local function studsToMeters(studs)
+    return studs / 3.571
+end
+
+-- 创建废料标签函数
+local function createTrashLabel(trashPart, distanceInStuds)
+    if not trashEspEnabled then return nil end
+    
+    if not trashPart:FindFirstChild("TrashLabel") then
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "TrashLabel"
+        billboard.AlwaysOnTop = true
+        billboard.Size = UDim2.new(0, 200, 0, 50)
+        billboard.StudsOffset = Vector3.new(0, 2, 0)
+        billboard.Adornee = trashPart
+        billboard.MaxDistance = trashConfig.maxDistance
+        billboard.Enabled = trashEspEnabled
+        
+        local textLabel = Instance.new("TextLabel")
+    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.BackgroundTransparency = 1
+    textLabel.Text = string.format("%s\n%.1f米", trashConfig.tagPrefix, studsToMeters(distanceInStuds))
+    textLabel.TextColor3 = trashConfig.labelColor
+    textLabel.TextSize = trashConfig.labelSize
+    textLabel.Font = Enum.Font.SourceSansBold
+    textLabel.TextStrokeTransparency = 0.5
+    textLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+    
+    textLabel.Parent = billboard
+    billboard.Parent = trashPart
+    
+    return billboard
+    end
+    return trashPart:FindFirstChild("TrashLabel")
+end
+
+-- 更新废料标签距离
+local function updateTrashLabel(trashPart, distanceInStuds)
+    local label = trashPart:FindFirstChild("TrashLabel")
+    if label then
+        label.TextLabel.Text = string.format("%s\n%.1f米", trashConfig.tagPrefix, studsToMeters(distanceInStuds))
+        
+        -- 根据距离调整标签大小
+        local scale = math.clamp(1 - (distanceInStuds / trashConfig.maxDistance) * 0.5, 0.5, 1)
+        label.TextLabel.TextSize = trashConfig.labelSize * scale
+    end
+end
+
+-- 高亮废料的函数
+local function highlightTrash(trashPart)
+    if not trashEspEnabled then return end
+    
+    if not highlightedTrash[trashPart] then
+        local highlight = Instance.new("Highlight")
+        highlight.Name = "TrashHighlight"
+        highlight.FillColor = trashConfig.highlightColor
+        highlight.FillTransparency = trashConfig.highlightTransparency
+        highlight.OutlineColor = trashConfig.highlightColor
+        highlight.OutlineTransparency = 0
+        highlight.Adornee = trashPart
+        highlight.Enabled = trashEspEnabled
+        highlight.Parent = trashPart
+        
+        highlightedTrash[trashPart] = highlight
+    end
+end
+
+-- 检查是否处于密集区域
+local function isInDenseArea(trashPart, nearbyTrash)
+    local count = 0
+    local pos = trashPart.Position
+    
+    for _, otherTrash in ipairs(nearbyTrash) do
+        if otherTrash ~= trashPart and (pos - otherTrash.Position).Magnitude <= trashConfig.denseRadius then
+            count = count + 1
+            if count >= trashConfig.denseThreshold then
+                return true
+            end
+        end
+    end
+    
+    return false
+end
+
+-- 全图扫描废料
+local function fullScanTrash()
+    if trashScanning or not trashEspEnabled then return end
+    trashScanning = true
+    
+    local startTime = os.clock()
+    trashCache = {}
+    
+    -- 扩展搜索条件
+    local trashKeywords = {"trash", "scrap", "junk", "waste", "debris", "rubbish", "garbage", "废料", "垃圾"}
+    
+    -- 扫描工作区
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local lowerName = obj.Name:lower()
+            for _, keyword in ipairs(trashKeywords) do
+                if lowerName:find(keyword) then
+                    table.insert(trashCache, obj)
+                    break
+                end
+            end
+        end
+    end
+    
+    -- 扫描模型
+    for _, model in ipairs(workspace:GetChildren()) do
+        if model:IsA("Model") then
+            local lowerName = model.Name:lower()
+            for _, keyword in ipairs(trashKeywords) do
+                if lowerName:find(keyword) then
+                    for _, part in ipairs(model:GetDescendants()) do
+                        if part:IsA("BasePart") then
+                            table.insert(trashCache, part)
+                        end
+                    end
+                    break
+                end
+            end
+        end
+    end
+    
+    trashScanning = false
+    lastScanTimeTrash = os.clock()
+    print(string.format("全图扫描完成，找到 %d 个废料，耗时 %.2f 秒", #trashCache, os.clock() - startTime))
+end
+
+-- 清除不再需要的废料高亮
+local function cleanUpHighlights(currentTrash)
+    for trashPart, highlight in pairs(highlightedTrash) do
+        if not table.find(currentTrash, trashPart) then
+            if highlight then highlight:Destroy() end
+            local label = trashPart:FindFirstChild("TrashLabel")
+            if label then label:Destroy() end
+            highlightedTrash[trashPart] = nil
+        end
+    end
+end
+
+-- 移除废料的高亮和标签
+local function removeTrashEffects(trashPart)
+    if highlightedTrash[trashPart] then
+        highlightedTrash[trashPart]:Destroy()
+        highlightedTrash[trashPart] = nil
+    end
+    
+    local label = trashPart:FindFirstChild("TrashLabel")
+    if label then
+        label:Destroy()
+    end
+end
+
+-- 更新附近的废料显示
+local function updateNearbyTrash()
+    if not trashEspEnabled then
+        cleanUpHighlights({})
+        return
+    end
+    
+    if not humanoidRootPart or not humanoidRootPart:IsDescendantOf(workspace) then
+        return
+    end
+    
+    local currentTime = os.clock()
+    if currentTime - lastScanTimeTrash > trashConfig.scanInterval then
+        task.spawn(fullScanTrash)
+    end
+    
+    local nearbyTrash = {}
+    local playerPos = humanoidRootPart.Position
+    
+    -- 按距离排序
+    table.sort(trashCache, function(a, b)
+        return (playerPos - a.Position).Magnitude < (playerPos - b.Position).Magnitude
+    end)
+    
+    -- 先收集所有在范围内的废料
+    local allNearby = {}
+    for _, trashPart in ipairs(trashCache) do
+        local distance = (playerPos - trashPart.Position).Magnitude
+        if distance <= trashConfig.maxDistance then
+            table.insert(allNearby, trashPart)
+        end
+    end
+    
+    -- 检查密集区域
+    local denseAreas = {}
+    for _, trashPart in ipairs(allNearby) do
+        if isInDenseArea(trashPart, allNearby) then
+            table.insert(denseAreas, trashPart)
+            removeTrashEffects(trashPart)
+        end
+    end
+    
+    -- 只显示最近的maxLabels个废料，排除密集区域的废料
+    local displayCount = 0
+    for _, trashPart in ipairs(allNearby) do
+        if displayCount >= trashConfig.maxLabels then break end
+        
+        -- 跳过密集区域的废料
+        if not table.find(denseAreas, trashPart) then
+            local distance = (playerPos - trashPart.Position).Magnitude
+            table.insert(nearbyTrash, trashPart)
+            highlightTrash(trashPart)
+            local label = createTrashLabel(trashPart, distance)
+            updateTrashLabel(trashPart, distance)
+            displayCount = displayCount + 1
+        end
+    end
+    
+    cleanUpHighlights(nearbyTrash)
+end
+
+-- ===== 信号枪透视功能 =====
+-- 创建提示GUI
+local function createFlareGunNotificationGui()
+    if flareGunNotificationGui then
+        flareGunNotificationGui:Destroy()
+    end
+    
+    flareGunNotificationGui = Instance.new("ScreenGui")
+    flareGunNotificationGui.Name = "FlareGunNotifications"
+    flareGunNotificationGui.Parent = LocalPlayer.PlayerGui
+    flareGunNotificationGui.ResetOnSpawn = false
+    flareGunNotificationGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    
+    return flareGunNotificationGui
+end
+
+-- 显示刷新提示
+local function showFlareGunRefreshNotification()
+    if not flareGunEspEnabled then return end
+    
+    local currentTime = os.clock()
+    
+    -- 检查冷却时间
+    if currentTime - flareGunNotificationCooldown < flareGunConfig.notificationCooldown then
+        return -- 冷却时间内不显示提示
+    end
+    
+    -- 防止重复显示
+    if currentTime - flareGunLastNotificationTime < flareGunConfig.notificationDuration then
+        return
+    end
+    
+    -- 更新冷却时间和最后提示时间
+    flareGunNotificationCooldown = currentTime
+    flareGunLastNotificationTime = currentTime
+    
+    local gui = createFlareGunNotificationGui()
+    
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0.4, 0, 0.08, 0)
+    frame.Position = UDim2.new(0.3, 0, 0.05, 0)
+    frame.BackgroundColor3 = Color3.new(0, 0, 0)
+    frame.BackgroundTransparency = 0.5
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+    
+    local textLabel = Instance.new("TextLabel")
+    textLabel.Size = UDim2.new(1, 0, 1, 0)
+    textLabel.BackgroundTransparency = 1
+    textLabel.Text = "已刷新信号枪"
+    textLabel.TextColor3 = flareGunConfig.notificationColor
+    textLabel.TextSize = 24
+    textLabel.Font = Enum.Font.SourceSansBold
+    textLabel.TextStrokeTransparency = 0.5
+    textLabel.TextStrokeColor3 = Color3.new(1, 1, 1)
+    textLabel.Parent = frame
+    
+    -- 淡入效果
+    frame.BackgroundTransparency = 1
+    textLabel.TextTransparency = 1
+    
+    local fadeIn = TweenService:Create(
+        frame,
+        TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        {BackgroundTransparency = 0.5}
+    )
+    
+    local textFadeIn = TweenService:Create(
+        textLabel,
+        TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        {TextTransparency = 0}
+    )
+    
+    fadeIn:Play()
+    textFadeIn:Play()
+    
+    -- 延迟后淡出
+    task.delay(flareGunConfig.notificationDuration, function()
+        if frame and frame.Parent then
+            local fadeOut = TweenService:Create(
+                frame,
+                TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                {BackgroundTransparency = 1}
+            )
+            
+            local textFadeOut = TweenService:Create(
+                textLabel,
+                TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+                {TextTransparency = 1}
+            )
+            
+            fadeOut:Play()
+            textFadeOut:Play()
+            
+            fadeOut.Completed:Connect(function()
+                if frame and frame.Parent then
+                    frame:Destroy()
+                end
+            end)
+        end
+    end)
+end
+
+-- 创建信号枪标签函数
+local function createFlareGunLabel(itemPart, distanceInStuds)
+    if not flareGunEspEnabled then return nil end
+    
+    if not itemPart:FindFirstChild("FlareGunLabel") then
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "FlareGunLabel"
+        billboard.AlwaysOnTop = true
+        billboard.Size = UDim2.new(0, 200, 0, 50)
+        billboard.StudsOffset = Vector3.new(0, 2, 0)
+        billboard.Adornee = itemPart
+        billboard.MaxDistance = flareGunConfig.maxDistance
+        
+        local textLabel = Instance.new("TextLabel")
+        textLabel.Size = UDim2.new(1, 0, 1, 0)
+        textLabel.BackgroundTransparency = 1
+        textLabel.Text = string.format("%s\n%.1f米", flareGunConfig.tagPrefix, studsToMeters(distanceInStuds))
+        textLabel.TextColor3 = flareGunConfig.labelColor
+        textLabel.TextSize = flareGunConfig.labelSize
+        textLabel.Font = Enum.Font.SourceSansBold
+        textLabel.TextStrokeTransparency = 0.5
+        textLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+        
+        textLabel.Parent = billboard
+        billboard.Parent = itemPart
+        
+        return billboard
+    end
+    return itemPart:FindFirstChild("FlareGunLabel")
+end
+
+-- 更新信号枪标签距离
+local function updateFlareGunLabel(itemPart, distanceInStuds)
+    if not flareGunEspEnabled then return end
+    
+    local label = itemPart:FindFirstChild("FlareGunLabel")
+    if label then
+        label.TextLabel.Text = string.format("%s\n%.1f米", flareGunConfig.tagPrefix, studsToMeters(distanceInStuds))
+        
+        -- 根据距离调整标签大小
+        local scale = math.clamp(1 - (distanceInStuds / flareGunConfig.maxDistance) * 0.5, 0.5, 1)
+        label.TextLabel.TextSize = flareGunConfig.labelSize * scale
+    end
+end
+
+-- 高亮信号枪的函数
+local function highlightFlareGunItem(itemPart)
+    if not flareGunEspEnabled then return end
+    
+    if not flareGunHighlightedItems[itemPart] then
+        local highlight = Instance.new("Highlight")
+        highlight.Name = "FlareGunHighlight"
+        highlight.FillColor = flareGunConfig.highlightColor
+        highlight.FillTransparency = flareGunConfig.highlightTransparency
+        highlight.OutlineColor = flareGunConfig.highlightColor
+        highlight.OutlineTransparency = 0
+        highlight.Adornee = itemPart
+        highlight.Parent = itemPart
+        
+        flareGunHighlightedItems[itemPart] = highlight
+    end
+end
+
+-- 全图扫描信号枪
+local function flareGunFullScan()
+    if not flareGunEspEnabled then return end
+    
+    if flareGunScanning then return end
+    flareGunScanning = true
+    
+    local startTime = os.clock()
+    local previousCount = #flareGunItemCache
+    flareGunItemCache = {}
+    
+    -- 搜索信号枪相关对象
+    local flareGunKeywords = {"flaregun", "flare_gun", "flare", "signalgun", "signal_gun"}
+    
+    -- 扫描工作区
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local lowerName = obj.Name:lower()
+            for _, keyword in ipairs(flareGunKeywords) do
+                if lowerName:find(keyword) then
+                    table.insert(flareGunItemCache, obj)
+                    break
+                end
+            end
+        end
+    end
+    
+    -- 扫描模型
+    for _, model in ipairs(workspace:GetChildren()) do
+        if model:IsA("Model") then
+            local lowerName = model.Name:lower()
+            for _, keyword in ipairs(flareGunKeywords) do
+                if lowerName:find(keyword) then
+                    for _, part in ipairs(model:GetDescendants()) do
+                        if part:IsA("BasePart") then
+                            table.insert(flareGunItemCache, part)
+                        end
+                    end
+                    break
+                end
+            end
+        end
+    end
+    
+    flareGunScanning = false
+    flareGunLastScanTime = os.clock()
+    
+    local newCount = #flareGunItemCache
+    print(string.format("[信号枪] 全图扫描完成，找到 %d 个信号枪相关物品，耗时 %.2f 秒", newCount, os.clock() - startTime))
+    
+    -- 如果检测到信号枪且数量有变化，显示提示
+    if newCount > 0 and newCount ~= previousCount then
+        showFlareGunRefreshNotification()
+    end
+end
+
+-- 清除不再需要的信号枪高亮
+local function flareGunCleanUpHighlights(currentItems)
+    for itemPart, highlight in pairs(flareGunHighlightedItems) do
+        if not table.find(currentItems, itemPart) then
+            if highlight then highlight:Destroy() end
+            local label = itemPart:FindFirstChild("FlareGunLabel")
+            if label then label:Destroy() end
+            flareGunHighlightedItems[itemPart] = nil
+        end
+    end
+end
+
+-- 更新附近的信号枪显示
+local function updateNearbyFlareGuns()
+    if not flareGunEspEnabled then 
+        flareGunCleanUpHighlights({})
+        return 
+    end
+    
+    if not humanoidRootPart or not humanoidRootPart:IsDescendantOf(workspace) then
+        return
+    end
+    
+    local currentTime = os.clock()
+    if currentTime - flareGunLastScanTime > flareGunConfig.scanInterval then
+        task.spawn(flareGunFullScan)
+    end
+    
+    local nearbyItems = {}
+    local playerPos = humanoidRootPart.Position
+    
+    -- 按距离排序
+    table.sort(flareGunItemCache, function(a, b)
+        return (playerPos - a.Position).Magnitude < (playerPos - b.Position).Magnitude
+    end)
+    
+    -- 只显示最近的maxLabels个信号枪
+    local displayCount = 0
+    for _, itemPart in ipairs(flareGunItemCache) do
+        if displayCount >= flareGunConfig.maxLabels then break end
+        
+        local distance = (playerPos - itemPart.Position).Magnitude
+        if distance <= flareGunConfig.maxDistance then
+            table.insert(nearbyItems, itemPart)
+            highlightFlareGunItem(itemPart)
+            local label = createFlareGunLabel(itemPart, distance)
+            updateFlareGunLabel(itemPart, distance)
+            displayCount += 1
+        end
+    end
+    
+    flareGunCleanUpHighlights(nearbyItems)
+end
+
+-- ===== 空投透视功能 =====
+-- 检查废料是否在不显示区域
+local function isInNoDisplayZone(partPosition)
+    local zoneCenter = airdropConfig.noDisplayZone.center
+    local zoneRadius = airdropConfig.noDisplayZone.radius
+    return (partPosition - zoneCenter).Magnitude <= zoneRadius
+end
+
+-- 创建空投标签函数
+local function createAirdropLabel(trashPart, distanceInStuds)
+    if not airdropEspEnabled then return nil end
+    
+    -- 检查是否在不显示区域
+    if isInNoDisplayZone(trashPart.Position) then
+        return nil
+    end
+    
+    if not trashPart:FindFirstChild("AirdropLabel") then
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "AirdropLabel"
+        billboard.AlwaysOnTop = true
+        billboard.Size = UDim2.new(0, 200, 0, 50)
+        billboard.StudsOffset = Vector3.new(0, 2, 0)
+        billboard.Adornee = trashPart
+        billboard.MaxDistance = airdropConfig.maxDistance
+        
+        local textLabel = Instance.new("TextLabel")
+        textLabel.Size = UDim2.new(1, 0, 1, 0)
+        textLabel.BackgroundTransparency = 1
+        textLabel.Text = string.format("%s\n%.1f米", airdropConfig.denseArea.airdropPrefix, studsToMeters(distanceInStuds))
+        textLabel.TextColor3 = airdropConfig.denseArea.airdropColor
+        textLabel.TextSize = airdropConfig.labelSize
+        textLabel.Font = Enum.Font.SourceSansBold
+        textLabel.TextStrokeTransparency = 0.5
+        textLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+        
+        textLabel.Parent = billboard
+        billboard.Parent = trashPart
+        
+        airdropLabeledTrash[trashPart] = billboard
+        return billboard
+    end
+    return trashPart:FindFirstChild("AirdropLabel")
+end
+
+-- 更新空投标签距离
+local function updateAirdropLabel(trashPart, distanceInStuds)
+    if not airdropEspEnabled then return end
+    
+    -- 检查是否在不显示区域
+    if isInNoDisplayZone(trashPart.Position) then
+        local label = trashPart:FindFirstChild("AirdropLabel")
+        if label then
+            label:Destroy()
+            airdropLabeledTrash[trashPart] = nil
+        end
+        return
+    end
+    
+    local label = trashPart:FindFirstChild("AirdropLabel")
+    if label then
+        label.TextLabel.Text = string.format("%s\n%.1f米", airdropConfig.denseArea.airdropPrefix, studsToMeters(distanceInStuds))
+        
+        -- 根据距离调整标签大小
+        local scale = math.clamp(1 - (distanceInStuds / airdropConfig.maxDistance) * 0.5, 0.5, 1)
+        label.TextLabel.TextSize = airdropConfig.labelSize * scale
+    end
+end
+
+-- 移除空投标签
+local function removeAirdropLabel(trashPart)
+    local label = trashPart:FindFirstChild("AirdropLabel")
+    if label then
+        label:Destroy()
+        airdropLabeledTrash[trashPart] = nil
+    end
+end
+
+-- 检测密集区域
+local function findDenseAreas(trashList)
+    local denseAreas = {}
+    local processed = {}
+    
+    for i, trash1 in ipairs(trashList) do
+        if not processed[trash1] then
+            local nearbyTrash = {}
+            
+            for j, trash2 in ipairs(trashList) do
+                if i ~= j and not processed[trash2] then
+                    local distance = (trash1.Position - trash2.Position).Magnitude
+                    if distance <= airdropConfig.denseArea.radius then
+                        table.insert(nearbyTrash, trash2)
+                    end
+                end
+            end
+            
+            -- 如果找到足够多的附近废料
+            if #nearbyTrash >= airdropConfig.denseArea.threshold - 1 then
+                table.insert(nearbyTrash, trash1)
+                table.insert(denseAreas, nearbyTrash)
+                
+                -- 标记这些废料为已处理
+                for _, trash in ipairs(nearbyTrash) do
+                    processed[trash] = true
+                end
+            end
+        end
+    end
+    
+    return denseAreas
+end
+
+-- 全图扫描废料
+local function airdropFullScan()
+    if not airdropEspEnabled then return end
+    
+    if airdropScanning then return end
+    airdropScanning = true
+    
+    local startTime = os.clock()
+    airdropTrashCache = {}
+    
+    -- 扩展搜索条件
+    local trashKeywords = {"trash", "scrap", "junk", "waste", "debris", "rubbish", "garbage", "废料", "垃圾"}
+    
+    -- 扫描工作区
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local lowerName = obj.Name:lower()
+            for _, keyword in ipairs(trashKeywords) do
+                if lowerName:find(keyword) then
+                    table.insert(airdropTrashCache, obj)
+                    break
+                end
+            end
+        end
+    end
+    
+    -- 扫描模型
+    for _, model in ipairs(workspace:GetChildren()) do
+        if model:IsA("Model") then
+            local lowerName = model.Name:lower()
+            for _, keyword in ipairs(trashKeywords) do
+                if lowerName:find(keyword) then
+                    for _, part in ipairs(model:GetDescendants()) do
+                        if part:IsA("BasePart") then
+                            table.insert(airdropTrashCache, part)
+                        end
+                    end
+                    break
+                end
+            end
+        end
+    end
+    
+    airdropScanning = false
+    airdropLastScanTime = os.clock()
+    print(string.format("[空投] 全图扫描完成，找到 %d 个废料，耗时 %.2f 秒", #airdropTrashCache, os.clock() - startTime))
+end
+
+-- 清除不再需要的空投标签
+local function airdropCleanUpLabels(currentTrash)
+    for trashPart, label in pairs(airdropLabeledTrash) do
+        if not table.find(currentTrash, trashPart) then
+            if label then label:Destroy() end
+            airdropLabeledTrash[trashPart] = nil
+        end
+    end
+end
+
+-- 更新附近的空投显示
+local function updateNearbyAirdrops()
+    if not airdropEspEnabled then 
+        airdropCleanUpLabels({})
+        return 
+    end
+    
+    if not humanoidRootPart or not humanoidRootPart:IsDescendantOf(workspace) then
+        return
+    end
+    
+    local currentTime = os.clock()
+    if currentTime - airdropLastScanTime > airdropConfig.scanInterval then
+        task.spawn(airdropFullScan)
+    end
+    
+    local nearbyTrash = {}
+    local playerPos = humanoidRootPart.Position
+    
+    -- 检测密集区域
+    local denseAreas = findDenseAreas(airdropTrashCache)
+    local inDenseArea = {} -- 标记哪些废料在密集区域中
+    
+    for _, area in ipairs(denseAreas) do
+        for _, trash in ipairs(area) do
+            inDenseArea[trash] = true
+        end
+    end
+    
+    -- 只显示最近的maxLabels个空投
+    local displayCount = 0
+    for _, trashPart in ipairs(airdropTrashCache) do
+        if displayCount >= airdropConfig.maxLabels then break end
+        
+        local distance = (playerPos - trashPart.Position).Magnitude
+        if distance <= airdropConfig.maxDistance then
+            -- 检查是否在不显示区域
+            if isInNoDisplayZone(trashPart.Position) then
+                -- 在不显示区域，移除所有标签
+                removeAirdropLabel(trashPart)
+                -- 不加入显示列表
+            else
+                -- 检查是否在密集区域
+                if inDenseArea[trashPart] then
+                    -- 如果是密集区域，只处理第一个废料作为代表
+                    local isFirstInArea = false
+                    for _, area in ipairs(denseAreas) do
+                        if area[1] == trashPart then
+                            isFirstInArea = true
+                            break
+                        end
+                    end
+                    
+                    if isFirstInArea then
+                        table.insert(nearbyTrash, trashPart)
+                        local label = createAirdropLabel(trashPart, distance)
+                        if label then
+                            updateAirdropLabel(trashPart, distance)
+                        end
+                        displayCount += 1
+                    else
+                        -- 密集区域中的其他废料，移除标签
+                        removeAirdropLabel(trashPart)
+                    end
+                else
+                    -- 普通废料，移除标签
+                    removeAirdropLabel(trashPart)
+                end
+            end
+        end
+    end
+    
+    airdropCleanUpLabels(nearbyTrash)
+end
+
+-- ===== 圆形悬浮窗与动画按钮 =====
+local function createCircularMenu()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "CircularMenuGUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.Parent = game.Players.LocalPlayer:WaitForChild("PlayerGui")
+    
+    -- 圆形主按钮 - 屏幕正右边中间位置
+    local mainButton = Instance.new("ImageButton")
+    mainButton.Name = "MainButton"
+    mainButton.Size = UDim2.new(0, 50, 0, 50)
+    mainButton.Position = UDim2.new(1, -60, 0.5, -25)
+    mainButton.AnchorPoint = Vector2.new(0, 0.5)
+    mainButton.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    mainButton.AutoButtonColor = true
+    
+    -- 圆形外观
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = mainButton
+    
+    -- 添加NY图案
+    local nyLabel = Instance.new("TextLabel")
+    nyLabel.Name = "NYLabel"
+    nyLabel.Size = UDim2.new(1, 0, 1, 0)
+    nyLabel.BackgroundTransparency = 1
+    nyLabel.Text = "NY"
+    nyLabel.TextColor3 = Color3.fromRGB(200, 200, 255)
+    nyLabel.TextSize = 20
+    nyLabel.Font = Enum.Font.SourceSansBold
+    nyLabel.Parent = mainButton
+    
+    -- 发光效果
+    local glow = Instance.new("UIStroke")
+    glow.Name = "Glow"
+    glow.Color = Color3.fromRGB(100, 150, 255)
+    glow.Thickness = 2
+    glow.Transparency = 0.5
+    glow.Parent = mainButton
+    
+    mainButton.Parent = screenGui
+    
+    -- 长方形菜单
+    local rectangleMenu = Instance.new("Frame")
+    rectangleMenu.Name = "RectangleMenu"
+    rectangleMenu.Size = UDim2.new(0, 0, 0, 0)
+    rectangleMenu.Position = UDim2.new(0.5, 0, 0.5, 0)
+    rectangleMenu.AnchorPoint = Vector2.new(0.5, 0.5)
+    rectangleMenu.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    rectangleMenu.BorderSizePixel = 0
+    rectangleMenu.Visible = false
+    rectangleMenu.ZIndex = 2
+    
+    -- 长方形菜单圆角
+    local menuCorner = Instance.new("UICorner")
+    menuCorner.CornerRadius = UDim.new(0, 8)
+    menuCorner.Parent = rectangleMenu
+    
+    -- 长方形菜单边框
+    local menuStroke = Instance.new("UIStroke")
+    menuStroke.Color = Color3.fromRGB(80, 120, 200)
+    menuStroke.Thickness = 2
+    menuStroke.Parent = rectangleMenu
+    
+    -- 标题栏
+    local titleBar = Instance.new("Frame")
+    titleBar.Name = "TitleBar"
+    titleBar.Size = UDim2.new(1, 0, 0, 30)
+    titleBar.Position = UDim2.new(0, 0, 0, 0)
+    titleBar.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    titleBar.BorderSizePixel = 0
+    titleBar.ZIndex = 3
+    
+    local titleCorner = Instance.new("UICorner")
+    titleCorner.CornerRadius = UDim.new(0, 8)
+    titleCorner.Parent = titleBar
+    
+    -- 标题文字
+    local titleText = Instance.new("TextLabel")
+    titleText.Name = "TitleText"
+    titleText.Size = UDim2.new(1, -40, 1, 0)
+    titleText.Position = UDim2.new(0, 10, 0, 0)
+    titleText.BackgroundTransparency = 1
+    titleText.Text = "NY 菜单"
+    titleText.TextColor3 = Color3.fromRGB(200, 200, 255)
+    titleText.TextSize = 16
+    titleText.TextXAlignment = Enum.TextXAlignment.Left
+    titleText.Font = Enum.Font.SourceSansBold
+    titleText.ZIndex = 3
+    titleText.Parent = titleBar
+    
+    -- 关闭按钮
+    local closeButton = Instance.new("TextButton")
+    closeButton.Name = "CloseButton"
+    closeButton.Size = UDim2.new(0, 30, 1, 0)
+    closeButton.Position = UDim2.new(1, -30, 0, 0)
+    closeButton.BackgroundColor3 = Color3.fromRGB(50, 50, 70)
+    closeButton.BorderSizePixel = 0
+    closeButton.Text = "X"
+    closeButton.TextColor3 = Color3.fromRGB(200, 200, 255)
+    closeButton.TextSize = 16
+    closeButton.Font = Enum.Font.SourceSansBold
+    closeButton.ZIndex = 3
+    
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 8)
+    closeCorner.Parent = closeButton
+    
+    closeButton.Parent = titleBar
+    titleBar.Parent = rectangleMenu
+    
+    -- 创建按钮容器
+    local buttonsContainer = Instance.new("Frame")
+    buttonsContainer.Name = "ButtonsContainer"
+    buttonsContainer.Size = UDim2.new(1, -20, 1, -40)
+    buttonsContainer.Position = UDim2.new(0, 10, 0, 40)
+    buttonsContainer.BackgroundTransparency = 1
+    buttonsContainer.ZIndex = 3
+    buttonsContainer.Parent = rectangleMenu
+    
+    -- 创建左侧按钮列
+    local leftColumn = Instance.new("Frame")
+    leftColumn.Name = "LeftColumn"
+    leftColumn.Size = UDim2.new(0.45, 0, 1, 0)
+    leftColumn.Position = UDim2.new(0, 0, 0, 0)
+    leftColumn.BackgroundTransparency = 1
+    leftColumn.ZIndex = 3
+    leftColumn.Parent = buttonsContainer
+    
+    -- 创建右侧按钮列
+    local rightColumn = Instance.new("Frame")
+    rightColumn.Name = "RightColumn"
+    rightColumn.Size = UDim2.new(0.45, 0, 1, 0)
+    rightColumn.Position = UDim2.new(0.55, 0, 0, 0)
+    rightColumn.BackgroundTransparency = 1
+    rightColumn.ZIndex = 3
+    rightColumn.Parent = buttonsContainer
+    
+    -- 创建玩家ESP开关按钮（左侧）
+    local playerEspButton = Instance.new("TextButton")
+    playerEspButton.Name = "PlayerESPButton"
+    playerEspButton.Size = UDim2.new(1, 0, 0, 30)
+    playerEspButton.Position = UDim2.new(0, 0, 0, 0)
+    playerEspButton.BackgroundColor3 = playerEspEnabled and Color3.fromRGB(50, 200, 80) or Color3.fromRGB(100, 100, 100)
+    playerEspButton.Text = playerEspEnabled and "玩家透视开启" or "玩家透视关闭"
+    playerEspButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    playerEspButton.TextSize = 14
+    playerEspButton.Font = Enum.Font.SourceSansBold
+    playerEspButton.AutoButtonColor = true
+    playerEspButton.ZIndex = 3
+    
+    -- 圆角
+    local buttonCorner = Instance.new("UICorner")
+    buttonCorner.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner.Parent = playerEspButton
+    
+    -- 创建敌人ESP开关按钮（左侧）
+    local enemyEspButton = Instance.new("TextButton")
+    enemyEspButton.Name = "EnemyESPButton"
+    enemyEspButton.Size = UDim2.new(1, 0, 0, 30)
+    enemyEspButton.Position = UDim2.new(0, 0, 0, 40)
+    enemyEspButton.BackgroundColor3 = enemyEspEnabled and Color3.fromRGB(50, 200, 80) or Color3.fromRGB(100, 100, 100)
+    enemyEspButton.Text = enemyEspEnabled and "Rake透视开启" or "Rake透视关闭"
+    enemyEspButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    enemyEspButton.TextSize = 14
+    enemyEspButton.Font = Enum.Font.SourceSansBold
+    enemyEspButton.AutoButtonColor = true
+    enemyEspButton.ZIndex = 3
+    
+    local buttonCorner2 = Instance.new("UICorner")
+    buttonCorner2.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner2.Parent = enemyEspButton
+    
+    -- 创建废料ESP开关按钮（左侧）
+    local trashEspButton = Instance.new("TextButton")
+    trashEspButton.Name = "TrashESPButton"
+    trashEspButton.Size = UDim2.new(1, 0, 0, 30)
+    trashEspButton.Position = UDim2.new(0, 0, 0, 80)
+    trashEspButton.BackgroundColor3 = trashEspEnabled and Color3.fromRGB(150, 75, 0) or Color3.fromRGB(100, 100, 100)
+    trashEspButton.Text = trashEspEnabled and "废料透视开启" or "废料透视关闭"
+    trashEspButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    trashEspButton.TextSize = 14
+    trashEspButton.Font = Enum.Font.SourceSansBold
+    trashEspButton.AutoButtonColor = true
+    trashEspButton.ZIndex = 3
+    
+    local buttonCorner3 = Instance.new("UICorner")
+    buttonCorner3.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner3.Parent = trashEspButton
+    
+    -- 创建信号枪透视开关按钮（左侧）
+    local flareGunEspButton = Instance.new("TextButton")
+    flareGunEspButton.Name = "FlareGunESPButton"
+    flareGunEspButton.Size = UDim2.new(1, 0, 0, 30)
+    flareGunEspButton.Position = UDim2.new(0, 0, 0, 120)
+    flareGunEspButton.BackgroundColor3 = flareGunEspEnabled and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(100, 100, 100)
+    flareGunEspButton.Text = flareGunEspEnabled and "信号枪透视开启" or "信号枪透视关闭"
+    flareGunEspButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    flareGunEspButton.TextSize = 14
+    flareGunEspButton.Font = Enum.Font.SourceSansBold
+    flareGunEspButton.AutoButtonColor = true
+    flareGunEspButton.ZIndex = 3
+    
+    local buttonCorner4 = Instance.new("UICorner")
+    buttonCorner4.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner4.Parent = flareGunEspButton
+    
+    -- 创建夜视开关按钮（右侧）
+    local nightVisionToggleButton = Instance.new("TextButton")
+    nightVisionToggleButton.Name = "NightVisionToggleButton"
+    nightVisionToggleButton.Size = UDim2.new(1, 0, 0, 30)
+    nightVisionToggleButton.Position = UDim2.new(0, 0, 0, 0)
+    nightVisionToggleButton.BackgroundColor3 = nightVisionEnabled and Color3.fromRGB(50, 200, 200) or Color3.fromRGB(100, 100, 100)
+    nightVisionToggleButton.Text = nightVisionEnabled and "夜视开启" or "夜视关闭"
+    nightVisionToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nightVisionToggleButton.TextSize = 14
+    nightVisionToggleButton.Font = Enum.Font.SourceSansBold
+    nightVisionToggleButton.AutoButtonColor = true
+    nightVisionToggleButton.ZIndex = 3
+    
+    local buttonCorner5 = Instance.new("UICorner")
+    buttonCorner5.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner5.Parent = nightVisionToggleButton
+    
+    -- 创建速度控制按钮（右侧）
+    local speedToggleButton = Instance.new("TextButton")
+    speedToggleButton.Name = "SpeedToggleButton"
+    speedToggleButton.Size = UDim2.new(1, 0, 0, 30)
+    speedToggleButton.Position = UDim2.new(0, 0, 0, 40)
+    speedToggleButton.BackgroundColor3 = isSpeedBoostEnabled and Color3.fromRGB(255, 165, 0) or Color3.fromRGB(100, 100, 100)
+    speedToggleButton.Text = isSpeedBoostEnabled and "速度开启" or "速度关闭"
+    speedToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    speedToggleButton.TextSize = 14
+    speedToggleButton.Font = Enum.Font.SourceSansBold
+    speedToggleButton.AutoButtonColor = true
+    speedToggleButton.ZIndex = 3
+    
+    local buttonCorner6 = Instance.new("UICorner")
+    buttonCorner6.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner6.Parent = speedToggleButton
+    
+    -- 创建地点标记按钮（右侧）
+    local locationMarkersButton = Instance.new("TextButton")
+    locationMarkersButton.Name = "LocationMarkersButton"
+    locationMarkersButton.Size = UDim2.new(1, 0, 0, 30)
+    locationMarkersButton.Position = UDim2.new(0, 0, 0, 80)
+    locationMarkersButton.BackgroundColor3 = isLocationMarkersEnabled and Color3.fromRGB(170, 0, 255) or Color3.fromRGB(100, 100, 100)
+    locationMarkersButton.Text = isLocationMarkersEnabled and "地点标记开启" or "地点标记关闭"
+    locationMarkersButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    locationMarkersButton.TextSize = 14
+    locationMarkersButton.Font = Enum.Font.SourceSansBold
+    locationMarkersButton.AutoButtonColor = true
+    locationMarkersButton.ZIndex = 3
+    
+    local buttonCorner7 = Instance.new("UICorner")
+    buttonCorner7.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner7.Parent = locationMarkersButton
+    
+    -- 创建空投透视开关按钮（右侧 - 第四个位置）
+    local airdropEspButton = Instance.new("TextButton")
+    airdropEspButton.Name = "AirdropESPButton"
+    airdropEspButton.Size = UDim2.new(1, 0, 0, 30)
+    airdropEspButton.Position = UDim2.new(0, 0, 0, 120) -- 第四个位置
+    airdropEspButton.BackgroundColor3 = airdropEspEnabled and Color3.fromRGB(139, 0, 0) or Color3.fromRGB(100, 100, 100)
+    airdropEspButton.Text = airdropEspEnabled and "空投透视开启" or "空投透视关闭"
+    airdropEspButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    airdropEspButton.TextSize = 14
+    airdropEspButton.Font = Enum.Font.SourceSansBold
+    airdropEspButton.AutoButtonColor = true
+    airdropEspButton.ZIndex = 3
+    
+    local buttonCorner8 = Instance.new("UICorner")
+    buttonCorner8.CornerRadius = UDim.new(0.2, 0)
+    buttonCorner8.Parent = airdropEspButton
+    
+    -- 将按钮添加到各自的列
+    playerEspButton.Parent = leftColumn
+    enemyEspButton.Parent = leftColumn
+    trashEspButton.Parent = leftColumn
+    flareGunEspButton.Parent = leftColumn
+    
+    nightVisionToggleButton.Parent = rightColumn
+    speedToggleButton.Parent = rightColumn
+    locationMarkersButton.Parent = rightColumn
+    airdropEspButton.Parent = rightColumn -- 添加到右侧
+    
+    rectangleMenu.Parent = screenGui
+    
+    -- 菜单状态
+    local rectangleVisible = false
+    
+    -- 显示长方形菜单的函数
+    local function showRectangleMenu()
+        rectangleVisible = true
+        rectangleMenu.Visible = true
+        
+        -- 动画效果：从中心展开
+        local expandTween = TweenService:Create(
+            rectangleMenu,
+            TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {Size = UDim2.new(0, 300, 0, 220)}
+        )
+        expandTween:Play()
+    end
+    
+    -- 隐藏长方形菜单的函数
+    local function hideRectangleMenu()
+        rectangleVisible = false
+        
+        -- 动画效果：收缩到中心
+        local collapseTween = TweenService:Create(
+            rectangleMenu,
+            TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            {Size = UDim2.new(0, 0, 0, 0)}
+        )
+        collapseTween:Play()
+        
+        -- 延迟后隐藏菜单
+        task.delay(0.3, function()
+            if not rectangleVisible then
+                rectangleMenu.Visible = false
+            end
+        end)
+    end
+    
+    -- 主按钮点击事件 - 显示长方形菜单
+    mainButton.MouseButton1Click:Connect(function()
+        if not rectangleVisible then
+            showRectangleMenu()
+        else
+            hideRectangleMenu()
+        end
+    end)
+    
+    -- 关闭按钮点击事件
+    closeButton.MouseButton1Click:Connect(hideRectangleMenu)
+    
+    -- 玩家ESP按钮点击事件
+    playerEspButton.MouseButton1Click:Connect(function()
+        playerEspEnabled = not playerEspEnabled
+        
+        playerEspButton.BackgroundColor3 = playerEspEnabled and Color3.fromRGB(50, 200, 80) or Color3.fromRGB(100, 100, 100)
+        playerEspButton.Text = playerEspEnabled and "玩家透视开启" or "玩家透视关闭"
+        
+        -- 更新所有玩家ESP的显示状态
+        for target, data in pairs(espCache) do
+            if not data.isEnemy then
+                local shouldShow = shouldShowESP(target, data)
+                if data.highlight then
+                    data.highlight.Enabled = shouldShow
+                end
+                if data.billboard then
+                    data.billboard.Enabled = shouldShow
+                end
+                if data.tracer then
+                    data.tracer.Enabled = shouldShow
+                end
+            end
+        end
+    end)
+    
+    -- 敌人ESP按钮点击事件
+    enemyEspButton.MouseButton1Click:Connect(function()
+        enemyEspEnabled = not enemyEspEnabled
+        
+        enemyEspButton.BackgroundColor3 = enemyEspEnabled and Color3.fromRGB(50, 200, 80) or Color3.fromRGB(100, 100, 100)
+        enemyEspButton.Text = enemyEspEnabled and "Rake透视开启" or "Rake透视关闭"
+        
+        -- 更新所有敌人ESP的显示状态
+        for target, data in pairs(espCache) do
+            if data.isEnemy then
+                local shouldShow = shouldShowESP(target, data)
+                if data.highlight then
+                    data.highlight.Enabled = shouldShow
+                end
+                if data.billboard then
+                    data.billboard.Enabled = shouldShow
+                end
+                if data.tracer then
+                    data.tracer.Enabled = shouldShow
+                end
+            end
+        end
+    end)
+    
+    -- 废料ESP按钮点击事件
+    trashEspButton.MouseButton1Click:Connect(function()
+        trashEspEnabled = not trashEspEnabled
+        
+        trashEspButton.BackgroundColor3 = trashEspEnabled and Color3.fromRGB(150, 75, 0) or Color3.fromRGB(100, 100, 100)
+        trashEspButton.Text = trashEspEnabled and "废料透视开启" or "废料透视关闭"
+        
+        if not trashEspEnabled then
+            -- 清除所有废料高亮
+            for trashPart, highlight in pairs(highlightedTrash) do
+                if highlight then highlight:Destroy() end
+                local label = trashPart:FindFirstChild("TrashLabel")
+                if label then label:Destroy() end
+                highlightedTrash[trashPart] = nil
+            end
+        else
+            -- 重新扫描废料
+            task.spawn(fullScanTrash)
+        end
+    end)
+    
+    -- 信号枪透视按钮点击事件
+    flareGunEspButton.MouseButton1Click:Connect(function()
+        flareGunEspEnabled = not flareGunEspEnabled
+        
+        flareGunEspButton.BackgroundColor3 = flareGunEspEnabled and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(100, 100, 100)
+        flareGunEspButton.Text = flareGunEspEnabled and "信号枪透视开启" or "信号枪透视关闭"
+        
+        if not flareGunEspEnabled then
+            -- 清除所有信号枪高亮
+            for itemPart, highlight in pairs(flareGunHighlightedItems) do
+                if highlight then highlight:Destroy() end
+                local label = itemPart:FindFirstChild("FlareGunLabel")
+                if label then label:Destroy() end
+                flareGunHighlightedItems[itemPart] = nil
+            end
+        else
+            -- 重新扫描信号枪
+            task.spawn(flareGunFullScan)
+        end
+    end)
+    
+    -- 夜视按钮点击事件
+    nightVisionToggleButton.MouseButton1Click:Connect(function()
+        local newState = toggleNightVision()
+        
+        nightVisionToggleButton.BackgroundColor3 = newState and Color3.fromRGB(50, 200, 200) or Color3.fromRGB(100, 100, 100)
+        nightVisionToggleButton.Text = newState and "夜视开启" or "夜视关闭"
+    end)
+    
+    -- 速度控制按钮点击事件
+    speedToggleButton.MouseButton1Click:Connect(function()
+        local newState = toggleSpeedBoost()
+        
+        speedToggleButton.BackgroundColor3 = newState and Color3.fromRGB(255, 165, 0) or Color3.fromRGB(100, 100, 100)
+        speedToggleButton.Text = newState and "速度提升开启" or "速度提升关闭"
+    end)
+    
+    -- 地点标记按钮点击事件
+    locationMarkersButton.MouseButton1Click:Connect(function()
+        local newState = toggleLocationMarkers()
+        
+        locationMarkersButton.BackgroundColor3 = newState and Color3.fromRGB(170, 0, 255) or Color3.fromRGB(100, 100, 100)
+        locationMarkersButton.Text = newState and "地点标记开启" or "地点标记关闭"
+    end)
+    
+    -- 空投透视按钮点击事件
+    airdropEspButton.MouseButton1Click:Connect(function()
+        airdropEspEnabled = not airdropEspEnabled
+        
+        airdropEspButton.BackgroundColor3 = airdropEspEnabled and Color3.fromRGB(139, 0, 0) or Color3.fromRGB(100, 100, 100)
+        airdropEspButton.Text = airdropEspEnabled and "空投透视开启" or "空投透视关闭"
+        
+        if not airdropEspEnabled then
+            -- 清除所有空投标签
+            for trashPart, label in pairs(airdropLabeledTrash) do
+                if label then label:Destroy() end
+                airdropLabeledTrash[trashPart] = nil
+            end
+        else
+            -- 重新扫描空投
+            task.spawn(airdropFullScan)
+        end
+    end)
+    
+    -- 修复后的拖拽功能
+    local dragging = false
+    local dragInput
+    local dragStart
+    local startPos
+    
+    local function update(input)
+        local delta = input.Position - dragStart
+        
+        local absoluteX = startPos.X.Offset + (startPos.X.Scale * screenGui.AbsoluteSize.X)
+        local absoluteY = startPos.Y.Offset + (startPos.Y.Scale * screenGui.AbsoluteSize.Y)
+        
+        local newX = absoluteX + delta.X
+        local newY = absoluteY + delta.Y
+        
+        newX = math.clamp(newX, 0, screenGui.AbsoluteSize.X - mainButton.AbsoluteSize.X)
+        newY = math.clamp(newY, 0, screenGui.AbsoluteSize.Y - mainButton.AbsoluteSize.Y)
+        
+        local relativeX = newX / screenGui.AbsoluteSize.X
+        local relativeY = newY / screenGui.AbsoluteSize.Y
+        
+        mainButton.Position = UDim2.new(relativeX, 0, relativeY, 0)
+    end
+    
+    mainButton.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = mainButton.Position
+            
+            local connection
+            connection = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    connection:Disconnect()
+                end
+            end)
+        end
+    end)
+    
+    mainButton.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            update(input)
+        end
+    end)
+    
+    return screenGui
+end
+
+-- ===== 事件处理 =====
+-- 设置快捷键
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not gameProcessed then
+        if input.KeyCode == flareGunConfig.scanKey and flareGunEspEnabled then
+            flareGunFullScan()
+        elseif input.KeyCode == airdropConfig.scanKey and airdropEspEnabled then
+            airdropFullScan()
+        elseif input.KeyCode == trashConfig.scanKey and trashEspEnabled then
+            fullScanTrash()
+        end
+    end
+end)
+
+-- 主循环
+RunService.Heartbeat:Connect(function(deltaTime)
+    -- ESP更新
+    lastUpdate = lastUpdate + deltaTime
+    lastScanTime = lastScanTime + deltaTime
+    
+    if lastScanTime >= SETTINGS.SCAN_INTERVAL then
+        lastScanTime = 0
+        fullScan()
+    end
+    
+    if lastUpdate < SETTINGS.UPDATE_RATE then return end
+    lastUpdate = 0
+    
+    if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then return end
+    local localRoot = LocalPlayer.Character.HumanoidRootPart
+    
+    for target, data in pairs(espCache) do
+        if not target.Parent then
+            if data.highlight then data.highlight:Destroy() end
+            if data.billboard then data.billboard:Destroy() end
+            if data.tracer then data.tracer:Destroy() end
+            espCache[target] = nil
+        else
+            local distance = (data.rootPart.Position - localRoot.Position).Magnitude
+            local distanceInMeters = distance / 3.571
+            local shouldShow = distance <= SETTINGS.MAX_DISTANCE and shouldShowESP(target, data)
+            
+            data.billboard.Enabled = shouldShow
+            if data.tracer then
+                data.tracer.Enabled = shouldShow
+                if data.startAttachment then
+                    data.startAttachment.WorldPosition = localRoot.Position - Vector3.new(0, 1.5, 0)
+                end
+            end
+            
+            if shouldShow then
+                if distanceInMeters < SETTINGS.HIGHLIGHT_DISABLE_DISTANCE then
+                    data.highlight.Enabled = false
+                else
+                    data.highlight.Enabled = true
+                end
+            else
+                data.highlight.Enabled = false
+            end
+            
+            if shouldShow then
+                if SETTINGS.SHOW_DISTANCE then
+                    data.billboard.ESP_Distance.Text = string.format("%.1fm", distanceInMeters)
+                else
+                    data.billboard.ESP_Distance.Text = ""
+                end
+                
+                if SETTINGS.SHOW_HEALTH and data.humanoid then
+                    data.billboard.ESP_Health.Text = string.format("HP: %d/%d", 
+                        math.floor(data.humanoid.Health), 
+                        math.floor(data.humanoid.MaxHealth))
+                else
+                    data.billboard.ESP_Health.Text = ""
+                end
+                
+                data.billboard.ESP_Name.Text = target.Name
+            end
+        end
+    end
+    
+    -- 其他功能更新
+    updateNearbyTrash()
+    updateNearbyFlareGuns()
+    updateNearbyAirdrops()
+end)
+
+-- 玩家重生时重新获取角色
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    character = newChar
+    humanoidRootPart = newChar:WaitForChild("HumanoidRootPart")
+    
+    -- 重新创建信号枪提示GUI
+    createFlareGunNotificationGui()
+    
+    -- 重新初始化速度控制
+    initializeCharacter(newChar)
+end)
+
+-- ===== 初始化 =====
+-- 初始创建信号枪提示GUI
+createFlareGunNotificationGui()
+
+-- 创建圆形菜单
+createCircularMenu()
+
+-- 初始扫描（只在开启状态下执行）
+task.spawn(function()
+    -- 初始状态为关闭，不执行扫描
+    -- 用户点击按钮开启后会自动执行扫描
+end)
+
+print("高级游戏辅助脚本已激活")
+print("使用屏幕右侧的圆形按钮打开菜单")
+print(string.format("按 %s 键手动触发信号枪扫描", flareGunConfig.scanKey.Name))
+print(string.format("按 %s 键手动触发空投扫描", airdropConfig.scanKey.Name))
+print(string.format("按 %s 键手动触发废料扫描", trashConfig.scanKey.Name))
+print(string.format("已设置无显示区域: 坐标(%.2f, %.2f, %.2f), 半径%dstud", 
+    airdropConfig.noDisplayZone.center.X, airdropConfig.noDisplayZone.center.Y, airdropConfig.noDisplayZone.center.Z, 
+    airdropConfig.noDisplayZone.radius))
+print(string.format("已设置密集区域检测: 半径%dstud, 阈值%d个废料", 
+    airdropConfig.denseArea.radius, airdropConfig.denseArea.threshold))
+
+-- 所有功能默认关闭
+print("所有功能默认已关闭:")
+print("玩家ESP: " .. (playerEspEnabled and "开启" or "关闭"))
+print("敌人ESP: " .. (enemyEspEnabled and "开启" or "关闭"))
+print("废料ESP: " .. (trashEspEnabled and "开启" or "关闭"))
+print("信号枪透视: " .. (flareGunEspEnabled and "开启" or "关闭"))
+print("空投透视: " .. (airdropEspEnabled and "开启" or "关闭"))
+print("速度提升: " .. (isSpeedBoostEnabled and "开启" or "关闭"))
+print("地点标记: " .. (isLocationMarkersEnabled and "开启" or "关闭"))
+print("夜视功能: " .. (nightVisionEnabled and "开启" or "关闭"))
